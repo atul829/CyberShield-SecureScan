@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+venv/
+vuln-scanner-env/
+.env
+*.html
+*.csv
+*.xml
+*.json
+*.log
+.DS_Store
+*.bak

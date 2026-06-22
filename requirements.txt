@@ -1,0 +1,11 @@
+python3-nmap
+jinja2
+python-dotenv
+beautifulsoup4
+requests
+# For OpenAI provider (optional, only if using OpenAI)
+openai
+aiohttp>=3.9.0 # not directly required, pinned by Snyk to avoid a vulnerability
+ipaddress
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
+idna>=3.15 # not directly required, pinned by Snyk to avoid a vulnerability
