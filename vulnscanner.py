@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# CyberShield-SecureScan (multi-provider, AI-first)
+# CyberShield-SecureScan - AI-Powered Vulnerability Scanner
 
 import os
 import sys
@@ -22,6 +22,24 @@ from dotenv import load_dotenv
 from jinja2 import Template
 
 # ============================================================
+# TCI - Target Complexity Index
+# ============================================================
+try:
+    from tci import get_tci_plan
+    TCI_AVAILABLE = True
+except ImportError:
+    TCI_AVAILABLE = False
+
+# ============================================================
+# History Database
+# ============================================================
+try:
+    from history_db import store_scan_result, detect_trends
+    HISTORY_AVAILABLE = True
+except ImportError:
+    HISTORY_AVAILABLE = False
+
+# ============================================================
 # Environment
 # ============================================================
 _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -29,13 +47,10 @@ _pre_parser.add_argument("--env-file", default=".env")
 _pre_args, _ = _pre_parser.parse_known_args()
 load_dotenv(_pre_args.env_file)
 
-# ============================================================
-# Logging base config
-# ============================================================
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 # ============================================================
-# Provider Configs
+# Configs
 # ============================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
@@ -64,14 +79,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-# ============================================================
-# AI Defaults
-# ============================================================
 TEMPERATURE = 0.4
 TOKEN_LIMIT = 4096
 
 HTTP_SESSION = requests.Session()
-
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -89,7 +100,6 @@ HTTP_SESSION.mount("http://", adapter)
 # Scan Profiles
 # ============================================================
 LEGACY_DEFAULT_NMAP_ARGS = "-Pn -sV -T4 -F --host-timeout 5m -vvv"
-
 SCAN_PROFILES: Dict[int, str] = {
     1: LEGACY_DEFAULT_NMAP_ARGS,
     2: "-Pn -p- -sC -sV -T4 --host-timeout 10m -vvv",
@@ -98,7 +108,7 @@ SCAN_PROFILES: Dict[int, str] = {
 }
 
 # ============================================================
-# Ethics banner
+# Ethics Banner
 # ============================================================
 def print_ethical_warning():
     print("\n" + "=" * 80)
@@ -149,6 +159,7 @@ def ensure_nmap_available(nmap_path: Optional[str]) -> str:
 
 def validate_api_keys(provider: str) -> None:
     p = (provider or "openai").strip().lower()
+    key_present = True
     if p == "openai":
         key_present = bool(OPENAI_API_KEY)
     elif p == "gemini":
@@ -165,42 +176,25 @@ def validate_api_keys(provider: str) -> None:
         key_present = bool(GROQ_API_KEY)
     elif p == "deepseek":
         key_present = bool(DEEPSEEK_API_KEY)
-    else:
-        key_present = True
     if not key_present:
-        logging.error(
-            "Required API key/config for provider '%s' is not set. "
-            "Add it to your .env file and try again.",
-            provider,
-        )
+        logging.error("Required API key for provider '%s' is not set.", provider)
         sys.exit(1)
-    logging.debug("Groq API Key        : %s", mask_api_key(GROQ_API_KEY))
-    logging.debug("DeepSeek API Key    : %s", mask_api_key(DEEPSEEK_API_KEY))
-    logging.debug("Ollama API URL      : %s", OLLAMA_API_URL)
-    logging.debug("Ollama Model        : %s", OLLAMA_MODEL)
+    logging.debug("Groq API Key: %s", mask_api_key(GROQ_API_KEY))
+    logging.debug("DeepSeek API Key: %s", mask_api_key(DEEPSEEK_API_KEY))
 
 # ============================================================
-# Nmap scanning
+# Nmap Scanning
 # ============================================================
 def run_nmap_scan(nmap_bin: str, target: str, nmap_args: str) -> Dict[str, Any]:
     cmd = [nmap_bin] + shlex.split(nmap_args) + ["-oX", "-", target]
     logging.debug("Executing: %s", " ".join(cmd))
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=900,
-            check=False
-        )
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900, check=False)
     except Exception:
         logging.exception("Failed to execute nmap.")
         return {}
     if proc.returncode != 0:
         logging.error("nmap exited with code %s", proc.returncode)
-        if proc.stderr:
-            logging.error("stderr:\n%s", proc.stderr.strip())
     xml_text = proc.stdout.encode("utf-8", "ignore").decode("utf-8", "ignore").strip()
     if not xml_text.startswith("<?xml") and "<nmaprun" not in xml_text:
         logging.error("nmap output was not valid XML.")
@@ -219,14 +213,7 @@ def run_nmap_scan(nmap_bin: str, target: str, nmap_args: str) -> Dict[str, Any]:
 def parse_nmap_xml(root: ET.Element) -> Dict[str, Any]:
     hosts: List[Dict[str, Any]] = []
     for h in root.findall("host"):
-        host_entry = {
-            "status": None,
-            "address": None,
-            "hostnames": [],
-            "ports": [],
-            "os": [],
-            "scripts": []
-        }
+        host_entry = {"status": None, "address": None, "hostnames": [], "ports": [], "os": [], "scripts": []}
         status_el = h.find("status")
         if status_el is not None:
             host_entry["status"] = status_el.attrib.get("state")
@@ -250,22 +237,13 @@ def parse_nmap_xml(root: ET.Element) -> Dict[str, Any]:
                         service[k] = svc_el.attrib[k]
             scripts = []
             for s in p.findall("script"):
-                scripts.append({
-                    "id": s.attrib.get("id"),
-                    "output": s.attrib.get("output", ""),
-                })
+                scripts.append({"id": s.attrib.get("id"), "output": s.attrib.get("output", "")})
             host_entry["ports"].append({
-                "protocol": protocol,
-                "portid": portid,
-                "state": state,
-                "service": service,
-                "scripts": scripts
+                "protocol": protocol, "portid": portid, "state": state,
+                "service": service, "scripts": scripts
             })
         for s in h.findall("hostscript/script"):
-            host_entry["scripts"].append({
-                "id": s.attrib.get("id"),
-                "output": s.attrib.get("output", ""),
-            })
+            host_entry["scripts"].append({"id": s.attrib.get("id"), "output": s.attrib.get("output", "")})
         hosts.append(host_entry)
     return {"hosts": hosts}
 
@@ -287,8 +265,15 @@ def extract_open_ports(scan: Dict[str, Any]) -> str:
 # AI PROMPT
 # ============================================================
 def build_ai_prompt(scan: Dict[str, Any], open_ports: str, target: str,
-                    *, _scan_json: Optional[str] = None) -> str:
+                    *, _scan_json: Optional[str] = None, tci_result: Optional[Dict] = None) -> str:
     scan_json = (_scan_json if _scan_json is not None else json.dumps(scan, indent=2)).replace("```", "'''")
+    tci_section = ""
+    if tci_result:
+        tci_section = f"""
+Target Complexity Analysis:
+- TCI Score: {tci_result.get('tci_score', 0)}/100
+- Severity: {tci_result.get('severity', 'unknown').upper()}
+"""
     prompt = f"""
 You are a senior penetration tester and vulnerability analyst.
 
@@ -299,7 +284,7 @@ Nmap scan results (JSON):
 
 Open ports summary:
 {open_ports}
-
+{tci_section}
 Tasks:
 - Identify vulnerabilities and exposures
 - Map to OWASP, CWE, CAPEC
@@ -307,7 +292,6 @@ Tasks:
 - Provide business impact
 - Give concrete remediation steps
 - Prioritize findings
-- If data is insufficient, say what additional scans are needed
 
 Return an HTML report. No JavaScript.
 IMPORTANT: Do NOT wrap the output in Markdown code fences (no ```).
@@ -355,133 +339,122 @@ def wrap_ai_html(ai_html: str, trust_ai_html: bool) -> str:
 <meta charset="utf-8">
 <title>CyberShield Security Report</title>
 <style>
-:root {
-  --bg: #ffffff;
-  --fg: #1f2937;
-  --muted: #6b7280;
-  --border: #e5e7eb;
-  --critical: #7f1d1d;
-  --high: #b91c1c;
-  --medium: #f59e0b;
-  --low: #2563eb;
-}
-body {
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: var(--bg);
-  color: var(--fg);
-  margin: 0;
-  padding: 0;
-}
-header {
-  background: #111827;
-  color: #f9fafb;
-  padding: 24px 40px;
-}
-header h1 {
-  margin: 0;
-  font-size: 22px;
-}
-header .meta {
-  font-size: 13px;
-  color: #9ca3af;
-}
-main {
-  max-width: 1200px;
-  margin: auto;
-  padding: 40px;
-}
-section {
-  margin-bottom: 48px;
-}
-h2 {
-  border-bottom: 2px solid var(--border);
-  padding-bottom: 6px;
-}
-.finding {
-  border: 1px solid var(--border);
-  border-left: 6px solid #9ca3af;
-  padding: 16px;
-  margin: 20px 0;
-  background: #f9fafb;
-  border-radius: 4px;
-}
+:root { --bg: #ffffff; --fg: #1f2937; --muted: #6b7280; --border: #e5e7eb; --critical: #7f1d1d; --high: #b91c1c; --medium: #f59e0b; --low: #2563eb; }
+body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); margin: 0; padding: 0; }
+header { background: #111827; color: #f9fafb; padding: 24px 40px; }
+header h1 { margin: 0; font-size: 22px; }
+header .meta { font-size: 13px; color: #9ca3af; }
+main { max-width: 1200px; margin: auto; padding: 40px; }
+h2 { border-bottom: 2px solid var(--border); padding-bottom: 6px; }
+.finding { border: 1px solid var(--border); border-left: 6px solid #9ca3af; padding: 16px; margin: 20px 0; background: #f9fafb; border-radius: 4px; }
 .finding.critical { border-left-color: var(--critical); }
-.finding.high     { border-left-color: var(--high); }
-.finding.medium   { border-left-color: var(--medium); }
-.finding.low      { border-left-color: var(--low); }
-.severity {
-  font-weight: bold;
-}
+.finding.high { border-left-color: var(--high); }
+.finding.medium { border-left-color: var(--medium); }
+.finding.low { border-left-color: var(--low); }
+.severity { font-weight: bold; }
 .severity.critical { color: var(--critical); }
-.severity.high     { color: var(--high); }
-.severity.medium   { color: var(--medium); }
-.severity.low      { color: var(--low); }
-pre {
-  background: #f3f4f6;
-  padding: 12px;
-  overflow-x: auto;
-  border-radius: 4px;
-  font-size: 13px;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 12px 0;
-}
-th, td {
-  border: 1px solid var(--border);
-  padding: 8px;
-  text-align: left;
-}
-th {
-  background: #f3f4f6;
-}
-footer {
-  text-align: center;
-  color: var(--muted);
-  font-size: 12px;
-  padding: 40px;
-}
+.severity.high { color: var(--high); }
+.severity.medium { color: var(--medium); }
+.severity.low { color: var(--low); }
+pre { background: #f3f4f6; padding: 12px; overflow-x: auto; border-radius: 4px; font-size: 13px; }
+table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+th, td { border: 1px solid var(--border); padding: 8px; text-align: left; }
+th { background: #f3f4f6; }
+footer { text-align: center; color: var(--muted); font-size: 12px; padding: 40px; }
 </style>
 </head>
 <body>
 <header>
   <h1>CyberShield Security Report</h1>
-  <div class="meta">
-    Generated {{ timestamp }} • CyberShield-SecureScan • Authorized use only
-  </div>
+  <div class="meta">Generated {{ timestamp }} • CyberShield-SecureScan • Authorized use only</div>
 </header>
-<main>
-{{ body | safe }}
-</main>
-<footer>
-  This report was automatically generated.  
-  Always validate findings before production decisions.
-</footer>
+<main>{{ body | safe }}</main>
+<footer>This report was automatically generated. Always validate findings before production decisions.</footer>
 </body>
 </html>
 """)
-    return tpl.render(
-        body=body,
-        timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    return tpl.render(body=body, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
 
 # ============================================================
 # AI PROVIDERS
 # ============================================================
+def ask_groq(prompt: str, timeout: int = 60) -> str:
+    if not GROQ_API_KEY:
+        return "<b>Groq API key not configured.</b>"
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": TOKEN_LIMIT,
+    }
+    try:
+        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code == 401:
+            return "<b>Groq API error: Invalid API key.</b>"
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logging.error("Groq API error: %s", e)
+        return "<b>Groq API error.</b>"
+
+def ask_deepseek(prompt: str, timeout: int = 60) -> str:
+    if not DEEPSEEK_API_KEY:
+        return "<b>DeepSeek API key not configured.</b>"
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": TOKEN_LIMIT,
+    }
+    try:
+        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code == 402:
+            return "<b>DeepSeek API error: Payment required.</b>"
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logging.error("DeepSeek API error: %s", e)
+        return "<b>DeepSeek API error.</b>"
+
+def ask_ollama(prompt: str, timeout: int = 60) -> str:
+    url = f"{OLLAMA_API_URL.rstrip('/')}/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False,
+        "options": {"temperature": TEMPERATURE},
+    }
+    try:
+        r = HTTP_SESSION.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json().get("message", {}).get("content", "<b>Ollama returned empty content.</b>")
+    except Exception as e:
+        logging.error("Ollama API error: %s", e)
+        return "<b>Ollama API error.</b>"
+
 def ask_openai(prompt: str, timeout: int = 60) -> str:
     if not OPENAI_API_KEY:
         return "<b>OpenAI API key not configured.</b>"
     url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": prompt}
         ],
         "temperature": TEMPERATURE,
         "max_tokens": TOKEN_LIMIT,
@@ -494,234 +467,21 @@ def ask_openai(prompt: str, timeout: int = 60) -> str:
         logging.error("OpenAI API error: %s", e)
         return "<b>OpenAI API error.</b>"
 
-def ask_gemini(prompt: str, timeout: int = 60) -> str:
-    if not GEMINI_API_KEY:
-        return "<b>Gemini API key not configured.</b>"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    params = {"key": GEMINI_API_KEY}
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ],
-        "generationConfig": {
-            "temperature": TEMPERATURE,
-            "maxOutputTokens": TOKEN_LIMIT,
-        },
-    }
-    try:
-        r = HTTP_SESSION.post(url, params=params, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        candidates = data.get("candidates") or []
-        if not candidates:
-            return "<b>Gemini returned no candidates.</b>"
-        content = candidates[0].get("content") or {}
-        parts = content.get("parts") or []
-        if not parts:
-            return "<b>Gemini returned empty content.</b>"
-        return parts[0].get("text", "")
-    except Exception as e:
-        logging.error("Gemini API error: %s", e)
-        return "<b>Gemini API error.</b>"
-
-def ask_anthropic(prompt: str, timeout: int = 60) -> str:
-    if not ANTHROPIC_API_KEY:
-        return "<b>Anthropic API key not configured.</b>"
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": TOKEN_LIMIT,
-        "temperature": TEMPERATURE,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    }
-    try:
-        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        blocks = data.get("content") or []
-        texts = []
-        for b in blocks:
-            if isinstance(b, dict) and b.get("type") == "text" and "text" in b:
-                texts.append(b["text"])
-        return "\n".join(texts).strip() if texts else "<b>Anthropic returned empty content.</b>"
-    except Exception as e:
-        logging.error("Anthropic API error: %s", e)
-        return "<b>Anthropic API error.</b>"
-
-def ask_replit(prompt: str, timeout: int = 60) -> str:
-    if not REPLIT_API_KEY:
-        return "<b>Replit API key not configured.</b>"
-    url = REPLIT_API_URL
-    headers = {
-        "Authorization": f"Bearer {REPLIT_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": REPLIT_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": TEMPERATURE,
-        "max_tokens": TOKEN_LIMIT,
-    }
-    try:
-        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logging.error("Replit API error: %s", e)
-        return "<b>Replit API error.</b>"
-
-def ask_anythingllm(prompt: str, timeout: int = 60) -> str:
-    if not (ANYTHINGLLM_API_KEY and ANYTHINGLLM_API_URL):
-        return "<b>AnythingLLM API key/URL not configured.</b>"
-    base = ANYTHINGLLM_API_URL.rstrip("/")
-    url = f"{base}/api/v1/workspace/{ANYTHINGLLM_WORKSPACE}/chat"
-    headers = {
-        "Authorization": f"Bearer {ANYTHINGLLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {"message": prompt}
-    if ANYTHINGLLM_MODEL:
-        payload["model"] = ANYTHINGLLM_MODEL
-    try:
-        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        for k in ("text", "response", "message", "answer"):
-            if k in data and isinstance(data[k], str):
-                return data[k]
-        if isinstance(data.get("data"), dict):
-            for k in ("text", "response", "message", "answer"):
-                v = data["data"].get(k)
-                if isinstance(v, str):
-                    return v
-        return "<b>AnythingLLM returned an unrecognized response shape.</b>"
-    except Exception as e:
-        logging.error("AnythingLLM API error: %s", e)
-        return "<b>AnythingLLM API error.</b>"
-
-def ask_ollama(prompt: str, timeout: int = 60) -> str:
-    url = f"{OLLAMA_API_URL.rstrip('/')}/api/chat"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": TEMPERATURE},
-    }
-    try:
-        r = HTTP_SESSION.post(url, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("message", {}).get("content", "<b>Ollama returned empty content.</b>")
-    except Exception as e:
-        logging.error("Ollama API error: %s", e)
-        return "<b>Ollama API error. Is Ollama running? Try: ollama serve</b>"
-
-def ask_groq(prompt: str, timeout: int = 60) -> str:
-    if not GROQ_API_KEY:
-        return "<b>Groq API key not configured.</b>"
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": TEMPERATURE,
-        "max_tokens": TOKEN_LIMIT,
-    }
-    try:
-        logging.debug("Groq API call: model=%s, prompt_len=%d", GROQ_MODEL, len(prompt))
-        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code == 401:
-            logging.error("Groq API: Invalid API key.")
-            return "<b>Groq API error: Invalid API key. Check your GROQ_API_KEY in .env</b>"
-        if r.status_code == 402:
-            logging.error("Groq API: Payment required.")
-            return "<b>Groq API error: Payment required. Free credits may be exhausted.</b>"
-        r.raise_for_status()
-        result = r.json()
-        content = result["choices"][0]["message"]["content"]
-        logging.debug("Groq API success: response_len=%d", len(content))
-        return content
-    except requests.exceptions.Timeout:
-        logging.error("Groq API timeout after %d seconds", timeout)
-        return "<b>Groq API timeout. Try increasing --ai-timeout.</b>"
-    except requests.exceptions.RequestException as e:
-        logging.error("Groq API error: %s", e)
-        if hasattr(e, 'response') and e.response:
-            logging.error("Response: %s", e.response.text[:200])
-        return f"<b>Groq API error: {str(e)}</b>"
-    except Exception as e:
-        logging.error("Groq API unexpected error: %s", e)
-        return "<b>Groq API error.</b>"
-
-def ask_deepseek(prompt: str, timeout: int = 60) -> str:
-    if not DEEPSEEK_API_KEY:
-        return "<b>DeepSeek API key not configured.</b>"
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a senior penetration tester and vulnerability analyst."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": TEMPERATURE,
-        "max_tokens": TOKEN_LIMIT,
-    }
-    try:
-        r = HTTP_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code == 402:
-            logging.error("DeepSeek API: Payment required. Free credits exhausted.")
-            return "<b>DeepSeek API error: Payment required. Free credits exhausted. Add balance or use Groq/Ollama.</b>"
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logging.error("DeepSeek API error: %s", e)
-        return "<b>DeepSeek API error.</b>"
-
 def ask_provider(provider: str, prompt: str, timeout: int = 60) -> str:
-    p = (provider or "openai").strip().lower()
-    if p == "openai":
-        return ask_openai(prompt, timeout=timeout)
-    if p == "gemini":
-        return ask_gemini(prompt, timeout=timeout)
-    if p in ("anthropic", "claude"):
-        return ask_anthropic(prompt, timeout=timeout)
-    if p == "replit":
-        return ask_replit(prompt, timeout=timeout)
-    if p in ("anythingllm", "anything"):
-        return ask_anythingllm(prompt, timeout=timeout)
-    if p == "ollama":
-        return ask_ollama(prompt, timeout=timeout)
+    p = (provider or "groq").strip().lower()
     if p == "groq":
-        return ask_groq(prompt, timeout=timeout)
-    if p == "deepseek":
-        return ask_deepseek(prompt, timeout=timeout)
-    return f"<b>Unknown provider: {escape(provider)}</b>"
-    # ============================================================
-# EXPORTERS
+        return ask_groq(prompt, timeout)
+    elif p == "deepseek":
+        return ask_deepseek(prompt, timeout)
+    elif p == "ollama":
+        return ask_ollama(prompt, timeout)
+    elif p == "openai":
+        return ask_openai(prompt, timeout)
+    else:
+        return f"<b>Unknown provider: {provider}</b>"
+
+# ============================================================
+# Exporters
 # ============================================================
 def export_report_html(ai_html: str, filename: str, trust_ai_html: bool):
     html = wrap_ai_html(ai_html, trust_ai_html)
@@ -735,11 +495,7 @@ def export_report_txt(ai_text: str, filename: str):
 
 def export_report_json(scan: Dict[str, Any], ai_output: str, filename: str, meta: Dict[str, Any]):
     ai_output = strip_markdown_fences(ai_output)
-    payload = {
-        "meta": meta,
-        "scan": scan,
-        "ai_output": ai_output,
-    }
+    payload = {"meta": meta, "scan": scan, "ai_output": ai_output}
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
@@ -762,16 +518,12 @@ def export_report_csv(scan: Dict[str, Any], ai_output: str, filename: str, meta:
                 "service_version": (p.get("service") or {}).get("version", ""),
                 "service_extrainfo": (p.get("service") or {}).get("extrainfo", ""),
             })
-    fieldnames = [
-        "target", "host_address", "hostname",
-        "protocol", "port", "state",
-        "service_name", "service_product", "service_version", "service_extrainfo"
-    ]
+    fieldnames = ["target", "host_address", "hostname", "protocol", "port", "state",
+                  "service_name", "service_product", "service_version", "service_extrainfo"]
     with open(filename, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for r in rows:
-            w.writerow(r)
+        w.writerows(rows)
 
 def export_report_xml(scan: Dict[str, Any], ai_output: str, filename: str, meta: Dict[str, Any]):
     ai_output = strip_markdown_fences(ai_output)
@@ -784,8 +536,7 @@ def export_report_xml(scan: Dict[str, Any], ai_output: str, filename: str, meta:
     scan_el.text = json.dumps(scan, ensure_ascii=False)
     ai_el = ET.SubElement(root, "ai_output")
     ai_el.text = ai_output
-    tree = ET.ElementTree(root)
-    tree.write(filename, encoding="utf-8", xml_declaration=True)
+    ET.ElementTree(root).write(filename, encoding="utf-8", xml_declaration=True)
 
 # ============================================================
 # MAIN
@@ -807,52 +558,34 @@ def setup_debug_logging(debug: bool, debug_log: Optional[str]):
         logging.debug("Debug log file enabled: %s", debug_log)
 
 def resolve_nmap_args(args: argparse.Namespace) -> Tuple[str, int, bool]:
-    user_provided_nmap_args = hasattr(args, "nmap_args")
+    user_provided = hasattr(args, "nmap_args")
     profile = getattr(args, "profile", 1)
     if profile not in SCAN_PROFILES:
-        raise ValueError(f"Invalid profile {profile}. Available: {sorted(SCAN_PROFILES.keys())}")
-    if user_provided_nmap_args:
+        raise ValueError(f"Invalid profile {profile}")
+    if user_provided:
         return args.nmap_args, profile, False
     return SCAN_PROFILES[profile], profile, True
 
 def build_output_filename(target: str, output_format: str) -> str:
     ts = int(time.time())
     safe_target = re.sub(r"[^a-zA-Z0-9._-]+", "_", target)
-    ext = output_format.lower().strip()
-    return f"{safe_target}-{ts}.{ext}"
+    return f"{safe_target}-{ts}.{output_format}"
 
 def main():
     print_ethical_warning()
     parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--target", default=None,
-                        help="Target IP or hostname (required unless --list-profiles)")
-    parser.add_argument("--env-file", default=".env",
-                        help="Path to .env file (default: .env)")
+    parser.add_argument("-t", "--target", help="Target IP or hostname")
+    parser.add_argument("--env-file", default=".env")
     parser.add_argument("--nmap-path", default=None)
     parser.add_argument("--nmap-args", default=argparse.SUPPRESS)
-    parser.add_argument("--provider", default="groq")
-    parser.add_argument("--ai-timeout", type=int, default=120,
-                        help="Timeout in seconds for AI API calls (default: 120)")
+    parser.add_argument("--provider", default="groq", help="AI provider: groq, deepseek, ollama, openai")
+    parser.add_argument("--ai-timeout", type=int, default=120)
     parser.add_argument("--trust-ai-html", action="store_true")
     parser.add_argument("-d", "--debug", action="store_true")
     parser.add_argument("-dl", "--debug-log", nargs="?", const="vulnscanner-debug.log")
-    parser.add_argument(
-        "-o", "--output",
-        choices=["html", "csv", "xml", "txt", "json"],
-        default="html",
-        help="Output format: html, csv, xml, txt, or json (default: html)"
-    )
-    parser.add_argument(
-        "-p", "--profile",
-        type=int,
-        default=1,
-        help=f"Scan profile number (available: {sorted(SCAN_PROFILES.keys())})"
-    )
-    parser.add_argument(
-        "--list-profiles",
-        action="store_true",
-        help="Print available scan profiles and exit",
-    )
+    parser.add_argument("-o", "--output", choices=["html", "csv", "xml", "txt", "json"], default="html")
+    parser.add_argument("-p", "--profile", type=int, default=1)
+    parser.add_argument("--list-profiles", action="store_true")
 
     args = parser.parse_args()
     setup_debug_logging(args.debug, args.debug_log)
@@ -867,7 +600,6 @@ def main():
         parser.error("the following arguments are required: -t/--target")
 
     validate_api_keys(args.provider)
-
     target = sanitize_target(args.target)
     if not is_safe_target(target):
         logging.error("Invalid target.")
@@ -897,23 +629,58 @@ def main():
     open_ports = extract_open_ports(scan)
     logging.info("Open ports: %s", open_ports)
 
-    MAX_SCAN_JSON_CHARS = 100_000
+    # TCI Analysis
+    tci_result = None
+    if TCI_AVAILABLE:
+        try:
+            tci_result = get_tci_plan(scan)
+            logging.info("TCI Score: %d/100 (Severity: %s)", 
+                        tci_result.get('tci_score', 0), 
+                        tci_result.get('severity', 'unknown').upper())
+        except Exception as e:
+            logging.warning("TCI analysis failed: %s", e)
+
+    # History Database
+    if HISTORY_AVAILABLE:
+        try:
+            meta_for_db = {
+                'target': target,
+                'provider': args.provider,
+                'report_file': 'pending',
+                'tci_score': tci_result.get('tci_score', 0) if tci_result else 0,
+                'tci_severity': tci_result.get('severity', 'unknown') if tci_result else 'unknown',
+                'vulnerabilities': []
+            }
+            store_scan_result(scan, meta_for_db)
+            logging.info("Scan results stored in history database")
+            
+            try:
+                trends = detect_trends(target)
+                if trends.get('scan_count', 0) >= 2:
+                    logging.info("Trend: TCI=%s, Severity=%s", 
+                                trends.get('tci_direction', 'unknown'),
+                                trends.get('severity_direction', 'unknown'))
+            except Exception:
+                pass
+        except Exception as e:
+            logging.warning("History storage failed: %s", e)
+
+    # AI Analysis
+    MAX_SCAN_JSON_CHARS = 100000
     scan_json_str = json.dumps(scan, indent=2)
     if len(scan_json_str) > MAX_SCAN_JSON_CHARS:
-        logging.warning("Scan JSON too large, truncating.")
         scan_json_str = scan_json_str[:MAX_SCAN_JSON_CHARS] + "\n... [truncated]"
 
-    prompt = build_ai_prompt(scan, open_ports, target, _scan_json=scan_json_str)
-
+    prompt = build_ai_prompt(scan, open_ports, target, _scan_json=scan_json_str, tci_result=tci_result)
     provider = args.provider
     logging.info("Sending to %s API...", provider)
     ai_output = ask_provider(provider, prompt, timeout=args.ai_timeout)
+
     if not ai_output:
         logging.error("AI returned empty output.")
         sys.exit(3)
 
     outfile = build_output_filename(target, args.output)
-
     meta = {
         "target": target,
         "provider": provider,
@@ -935,9 +702,6 @@ def main():
         export_report_csv(scan, ai_output, outfile, meta)
     elif fmt == "xml":
         export_report_xml(scan, ai_output, outfile, meta)
-    else:
-        logging.error("Unsupported output format: %s", fmt)
-        sys.exit(4)
 
     print(f"Scan complete. Output written to {outfile}")
 
